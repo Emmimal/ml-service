@@ -1,0 +1,177 @@
+# .github/workflows/ml-deploy.yml
+#
+# CI/CD pipeline for the ML inference service.
+#
+# Pipeline stages:
+#   1. test         — lint, unit tests, integration tests
+#   2. build        — Docker image, push to registry
+#   3. deploy-stg   — deploy to staging, run smoke test
+#   4. deploy-prod  — deploy to production (requires manual approval)
+#
+# Required repository secrets:
+#   DOCKERHUB_USERNAME    — or replace with your registry of choice
+#   DOCKERHUB_TOKEN
+#   STG_HOST              — staging server SSH host
+#   STG_SSH_KEY           — private key for staging SSH
+#   PROD_HOST             — production server SSH host
+#   PROD_SSH_KEY          — private key for production SSH
+
+name: ML Service — CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/ml-inference-api
+  PYTHON_VERSION: "3.11"
+
+jobs:
+
+  # ── 1. Test ────────────────────────────────────────────────────────────────
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Train model (generates artifacts needed by tests)
+        run: python -m model.train
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/ -v \
+            --tb=short \
+            --junitxml=pytest-report.xml
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-report
+          path: pytest-report.xml
+
+  # ── 2. Build & Push Docker image ───────────────────────────────────────────
+  build:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Train model to embed artifact in image
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: |
+          pip install -r requirements.txt
+          python -m model.train
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            MODEL_VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+  # ── 3. Deploy to staging ───────────────────────────────────────────────────
+  deploy-stg:
+    name: Deploy → Staging
+    runs-on: ubuntu-latest
+    needs: build
+    environment: staging
+
+    steps:
+      - name: Pull and restart on staging
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STG_HOST }}
+          username: deploy
+          key: ${{ secrets.STG_SSH_KEY }}
+          script: |
+            docker pull ${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
+            docker stop ml_api || true
+            docker rm   ml_api || true
+            docker run -d \
+              --name ml_api \
+              --restart unless-stopped \
+              -p 8000:8000 \
+              -e MODEL_VERSION=${{ needs.build.outputs.image_tag }} \
+              ${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
+
+      - name: Smoke test staging /health
+        run: |
+          sleep 15
+          curl --fail --retry 5 --retry-delay 3 \
+            http://${{ secrets.STG_HOST }}:8000/health
+
+  # ── 4. Deploy to production (manual approval) ──────────────────────────────
+  deploy-prod:
+    name: Deploy → Production
+    runs-on: ubuntu-latest
+    needs: [build, deploy-stg]
+    environment: production   # GitHub environment with required reviewer
+
+    steps:
+      - name: Pull and restart on production
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: deploy
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            docker pull ${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
+            docker stop ml_api_prod || true
+            docker rm   ml_api_prod || true
+            docker run -d \
+              --name ml_api_prod \
+              --restart unless-stopped \
+              -p 8000:8000 \
+              -e MODEL_VERSION=${{ needs.build.outputs.image_tag }} \
+              ${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
+
+      - name: Smoke test production /health
+        run: |
+          sleep 15
+          curl --fail --retry 5 --retry-delay 3 \
+            http://${{ secrets.PROD_HOST }}:8000/health
